@@ -3,13 +3,13 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-class PoseEstimator:
+class PoseEstimator3D:
     def __init__(self,
                  min_detection_confidence=0.5,
                  min_tracking_confidence=0.5,
                  roi_padding=40):
         """
-        MediaPipe 포즈 추정기 초기화 (동적 ROI 지원)
+        MediaPipe 3D 포즈 추정기 초기화 (동적 ROI 지원)
         Args:
             min_detection_confidence (float): 최소 감지 신뢰도
             min_tracking_confidence (float): 최소 추적 신뢰도
@@ -17,10 +17,10 @@ class PoseEstimator:
         """
         mp_pose = mp.solutions.pose
         self.pose = mp_pose.Pose(
-            static_image_mode=False, # 비디오 스트림 처리
+            static_image_mode=False,
             model_complexity=1,
             smooth_landmarks=True,
-            enable_segmentation=False, # 필요 시 True로 변경 가능
+            enable_segmentation=False,
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
@@ -29,39 +29,46 @@ class PoseEstimator:
         self.roi_active = False # 현재 ROI를 사용 중인지 여부
         self.roi_padding = roi_padding # 픽셀 단위 패딩
 
-        print("PoseEstimator with Dynamic ROI initialized.")
+        # Z값 안정화를 위한 변수 추가
+        self.z_history = {}  # 키포인트별 Z값 이력 저장
+        self.z_history_max_length = 10  # 이력 길이 (프레임 수)
+        self.z_baseline = None  # 기준 Z값 (초기화 후 설정)
+        self.z_scale_factor = 0.5  # Z값 스케일 감소 (변화 줄이기)
+        self.initialization_frames = 30  # 초기화에 사용할 프레임 수
+        self.frame_count = 0  # 프레임 카운터
+        self.initial_z_values = []  # 초기 Z값 저장용
 
-    def _calculate_roi_from_landmarks(self, landmarks, frame_width, frame_height):
+    def _calculate_roi(self, landmarks, frame):
         """
-        주어진 랜드마크(Full-frame Normalized)를 기반으로 ROI BBox(픽셀 좌표)를 계산합니다.
+        랜드마크 기반으로 ROI 계산
         Args:
-            landmarks (list): MediaPipe Landmark 객체 리스트.
-            frame_width (int): 원본 프레임 너비.
-            frame_height (int): 원본 프레임 높이.
+            landmarks (list): MediaPipe Landmark 객체 리스트
+            frame (numpy.ndarray): 입력 프레임
         Returns:
-            tuple: 계산된 ROI 좌표 (x_min, y_min, x_max, y_max) 픽셀. 실패 시 None.
+            tuple: 계산된 ROI 좌표 (x_min, y_min, x_max, y_max) 픽셀
         """
+        height, width = frame.shape[:2]
+
         if not landmarks:
             return None
 
         # Normalized 좌표를 픽셀 좌표로 변환
         try:
-            x_coords = [lm.x * frame_width for lm in landmarks]
-            y_coords = [lm.y * frame_height for lm in landmarks]
+            x_values = [lm.x * width for lm in landmarks]
+            y_values = [lm.y * height for lm in landmarks]
 
-            if not x_coords or not y_coords: # 유효 좌표 없으면 실패
+            if not x_values or not y_values: # 유효 좌표 없으면 실패
                  return None
 
-        except AttributeError: # 혹시 landmarks 구조가 다를 경우
+        except AttributeError: # landmarks 구조가 다를 경우
              print("Error: Landmarks object structure unexpected.")
              return None
-
-
-        # 바운딩 박스 계산
-        x_min = min(x_coords)
-        y_min = min(y_coords)
-        x_max = max(x_coords)
-        y_max = max(y_coords)
+        
+        # 랜드마크 기반 ROI 좌표 계산
+        x_min = min(x_values)
+        y_min = min(y_values)
+        x_max = max(x_values)
+        y_max = max(y_values)
 
         # 패딩 추가
         x_min = int(x_min - self.roi_padding)
@@ -69,11 +76,11 @@ class PoseEstimator:
         x_max = int(x_max + self.roi_padding)
         y_max = int(y_max + self.roi_padding)
 
-        # 프레임 경계 내로 제한
+        # 경계 검사 (ROI가 프레임을 벗어나는 경우 조정)
         x_min = max(0, x_min)
         y_min = max(0, y_min)
-        x_max = min(frame_width, x_max)
-        y_max = min(frame_height, y_max)
+        x_max = min(width, x_max)
+        y_max = min(height, y_max)
 
         # 유효한 박스인지 확인 (넓이/높이가 0보다 커야 함)
         if x_min < x_max and y_min < y_max:
@@ -85,13 +92,11 @@ class PoseEstimator:
         """
         동적 ROI 기반 포즈 추정
         Args:
-            frame (numpy.ndarray): 입력 프레임 (BGR)
+            frame (numpy.ndarray): 입력 프레임
         Returns:
-            tuple: (pose_landmarks, annotated_frame)
-                   pose_landmarks: MediaPipe 포즈 랜드마크 객체 (전체 프레임 기준 Normalized). 감지 실패 시 None.
-                   annotated_frame: ROI와 포즈(감지 시)가 그려진 프레임 (BGR)
+            tuple: 포즈 랜드마크, ROI 표시된 프레임
         """
-        frame_height, frame_width, _ = frame.shape
+        height, width = frame.shape[:2]
         output_frame = frame.copy() # 결과용 프레임 복사
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -105,8 +110,8 @@ class PoseEstimator:
             # 프레임 범위 내로 ROI 좌표 조정
             x1 = max(0, x1)
             y1 = max(0, y1)
-            x2 = min(frame_width, x2)
-            y2 = min(frame_height, y2)
+            x2 = min(width, x2)
+            y2 = min(height, y2)
 
             if x1 < x2 and y1 < y2:
                 try:
@@ -154,15 +159,15 @@ class PoseEstimator:
                 pixel_x_frame = pixel_x_roi + offset_x
                 pixel_y_frame = pixel_y_roi + offset_y
                 # 3. 전체 프레임 기준 Normalized 좌표로 변환
-                landmark.x = pixel_x_frame / frame_width
-                landmark.y = pixel_y_frame / frame_height
+                landmark.x = pixel_x_frame / width
+                landmark.y = pixel_y_frame / height
                 # landmark.z = landmark.z * roi_w  # 너비 기준 z좌표 보정 (선택사항)
 
             corrected_landmarks_object = roi_landmarks # 보정된 랜드마크 객체 저장
 
             # 다음 프레임을 위한 새로운 ROI 계산
-            # 보정된 랜드마크(전체 프레임 Normalized) 사용
-            new_roi = self._calculate_roi_from_landmarks(corrected_landmarks_object.landmark, frame_width, frame_height)
+            # 보정된 랜드마크 사용
+            new_roi = self._calculate_roi(corrected_landmarks_object.landmark, frame)
 
             if new_roi:
                 self.roi_bbox = new_roi
@@ -182,7 +187,7 @@ class PoseEstimator:
         # 1. 현재 ROI 영역 그리기 (감지된 경우, 파란색 박스)
         if self.roi_active and self.roi_bbox:
              x1, y1, x2, y2 = self.roi_bbox
-             cv2.rectangle(output_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+             # ROI 박스 그리기 코드 제거: cv2.rectangle(output_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         elif not self.roi_active: # 비활성 상태 표시
              cv2.putText(output_frame, "ROI Inactive", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
@@ -203,25 +208,6 @@ class PoseEstimator:
         self.pose.close()
         print("MediaPipe Pose resources released.")
 
-
-class PoseEstimator3D(PoseEstimator): # PoseEstimator를 상속받아 중복 최소화
-    def __init__(self,
-                 min_detection_confidence=0.5,
-                 min_tracking_confidence=0.5,
-                 roi_padding=40):
-        """
-        MediaPipe 3D 포즈 추정기 초기화 (동적 ROI 지원)
-        PoseEstimator의 기능을 상속받습니다.
-        Args:
-            min_detection_confidence (float): 최소 감지 신뢰도
-            min_tracking_confidence (float): 최소 추적 신뢰도
-            roi_padding (int): 감지된 랜드마크 주변 ROI 여유 공간 (픽셀)
-        """
-        # PoseEstimator의 __init__ 호출
-        super().__init__(min_detection_confidence=min_detection_confidence,
-                         min_tracking_confidence=min_tracking_confidence,
-                         roi_padding=roi_padding)
-        print("PoseEstimator3D with Dynamic ROI initialized (inherits from PoseEstimator).")
 
     def extract_3d_keypoints(self, landmarks, frame):
         """

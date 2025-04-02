@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import os
 import sys
+import platform
 import logging
 from pose_estimator import PoseEstimator3D
 from kalman_filter import KalmanFilterTracker3D
@@ -22,7 +23,7 @@ class PoseTrackingSystem3D:
         """
         3D 포즈 추적 시스템 초기화
         Args:
-            roi_ratio (float): ROI 크기 비율 (0.0 ~ 1.0)
+            roi_padding (int): 감지된 랜드마크 주변 ROI 여유 공간 (픽셀)
         """
         self.pose_estimator = PoseEstimator3D(roi_padding=roi_padding)
         self.kalman_tracker = KalmanFilterTracker3D()
@@ -406,6 +407,8 @@ class PoseTrackingSystem3D:
         Returns:
             cv2.VideoCapture: 설정된 캡처 객체
         """
+        os_name = platform.system()
+
         if isinstance(input_source, str) and os.path.exists(input_source):
             # 비디오 파일 입력
             cap = cv2.VideoCapture(input_source)
@@ -419,12 +422,20 @@ class PoseTrackingSystem3D:
             logger.info(f"Video info: {width}x{height}, {fps}fps, {frame_count} frames")
         else:
             # 카메라 입력
-            try:
+            logger.info(f"Attempting to open camera: {input_source} on {os_name}")
+            backends = []
+            
+            if os_name == "Darwin": # macOS
                 # macOS에서는 AVFOUNDATION 백엔드 사용
                 cap = cv2.VideoCapture(input_source, cv2.CAP_AVFOUNDATION)
-            except:
-                # 다른 플랫폼에서는 기본 백엔드 사용
-                cap = cv2.VideoCapture(input_source)
+            elif os_name == "Windows":
+                # Windows에서는 DSHOW 백엔드 사용
+                cap = cv2.VideoCapture(input_source, cv2.CAP_DSHOW)
+            else: # Linux 등 기타
+                cap = cv2.VideoCapture(input_source, cv2.CAP_V4L2)
+
+            if not backends: # 기본값 (운영체제 특정 백엔드가 없을 경우)
+                cap = cv2.VideoCapture(input_source, cv2.CAP_ANY)
 
             # 카메라 속성 설정 (720p)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
